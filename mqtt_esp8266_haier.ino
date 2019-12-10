@@ -2,32 +2,33 @@
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
 
-const char* ssid = "...";
-const char* password = "...";
-const char* mqtt_server = "xx.xx.xx.xx"; //Сервер MQTT
+const char* ssid = "ssid"; // WIFI SSID
+const char* password = "password"; // WIFI Password
+const char* mqtt_server = "mosquittoip"; // MQTT Server
+const char* mqtt_user = "mosquitto"; // MQTT user
+const char* mqtt_password = "mosquitto"; // MQTT password
 
-IPAddress ip(xx,xx,xx,x); //IP модуля
-IPAddress gateway(xx,xx,xx,xx); // шлюз
-IPAddress subnet(xx,xx,xx,xx); // маска
+IPAddress ip(10,0,0,202); // Static IP
+IPAddress gateway(10,0,0,1); // Gateway
+IPAddress subnet(255,255,255,0); // Subnet Mask
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-#define ID_CONNECT "myhome-Conditioner"
-#define LED     12
-#define LEN_B   37
+#define Name_ID "Haier_Camera"
+#define LED     2
 
-#define B_CUR_TMP   13  //Текущая температура
-#define B_CMD       17  // 00-команда 7F-ответ ???
-#define B_MODE      23  //04 - DRY, 01 - cool, 02 - heat, 00 - smart 03 - вентиляция
-#define B_FAN_SPD   25  //Скорость 02 - min, 01 - mid, 00 - max, 03 - auto
-#define B_SWING     27  //01 - верхний и нижний предел вкл. 00 - выкл. 02 - левый/правый вкл. 03 - оба вкл
-#define B_LOCK_REM  28  //80 блокировка вкл. 00 -  выкл
-#define B_POWER     29  //on/off 01 - on, 00 - off (10, 11)-Компрессор??? 09 - QUIET
-#define B_FRESH     31  //fresh 00 - off, 01 - on
-#define B_SET_TMP   35  //Установленная температура
+#define B_CUR_TMP   13  // current temperature
+#define B_SET_TMP   35  // set temperature
+#define B_CMD       17  // 00 - command, 7F - reply
+#define B_MODE      23  // 00 - smart, 01 - cool, 02 - heat, 03 - fan_only, 04 - dry
+#define B_FAN_SPD   25  // 00 - max, 01 - mid, 02 - min, 03 - silent
+#define B_SWING     27  // 00 - off, 01 - vertical,  02 - horizontal, 03 - on
+#define B_LOCK_REM  28  // 00 - unlocked, 80 locked
+#define B_POWER     29  // 00 - off, 01 - on, 09 - ionizer, 10 11 - kondensor 
+#define B_FRESH     31  // 00 - off, 01 - on 
 
-int fresh;
+int fresh; // not on Nebula
 int power;
 int swing;
 int lock_rem;
@@ -35,18 +36,28 @@ int cur_tmp;
 int set_tmp;
 int fan_spd;
 int Mode;
+int noise;
+int light;
+int health;
+int health_airflow;
+int compressor;
+
+bool firsttransfer = true;
+bool transferinprog = false;
+int unclean = 0;
 long prev = 0;
-byte inCheck = 0;
-byte qstn[] = {255,255,10,0,0,0,0,0,1,1,77,1,90}; // Команда опроса
-//byte start[] = {255,255};
-byte data[37] = {}; //Массив данных
-byte on[]   = {255,255,10,0,0,0,0,0,1,1,77,2,91}; // Включение кондиционера
-byte off[]  = {255,255,10,0,0,0,0,0,1,1,77,3,92}; // Выключение кондиционера
-byte lock[] = {255,255,10,0,0,0,0,0,1,3,0,0,14};  // Блокировка пульта
-//byte buf[10];
+
+byte data[37] = {};
+byte olddata[37] = {};
+byte packdata[37] = {};
+byte qstn[] = {255,255,10,0,0,0,0,0,1,1,77,1,90}; // polling command
+byte on[]   = {255,255,10,0,0,0,0,0,1,1,77,2,91}; // turn on AC
+byte off[]  = {255,255,10,0,0,0,0,0,1,1,77,3,92}; // turn off AC
+byte lock[] = {255,255,10,0,0,0,0,0,1,3,0,0,14};  // remote lock
 
 void setup_wifi() {
   delay(10);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   WiFi.config(ip, gateway, subnet);
   while (WiFi.status() != WL_CONNECTED) {
@@ -57,122 +68,191 @@ void setup_wifi() {
 }
 
 void reconnect() {
-  digitalWrite(LED, !digitalRead(LED));
   while (!client.connected()) {
-    if (client.connect(ID_CONNECT)) {
-      client.publish("myhome/Conditioner/connection", "true");
-      client.publish("myhome/Conditioner/RAW", "");
-      client.subscribe("myhome/Conditioner/#");
-      digitalWrite(LED, HIGH);
+    digitalWrite(LED, !digitalRead(LED));
+    if (client.connect(Name_ID, mqtt_user, mqtt_password)) {
+      client.subscribe("Haier/Camera/set/set_tmp");
+      client.subscribe("Haier/Camera/set/Mode");
+      client.subscribe("Haier/Camera/set/fan_spd");
+      client.subscribe("Haier/Camera/set/swing");
+      client.subscribe("Haier/Camera/set/lock_rem");
+      client.subscribe("Haier/Camera/set/power");
+      client.subscribe("Haier/Camera/set/ionizer");
+      client.subscribe("Haier/Camera/set/fresh");
+      client.subscribe("Haier/Camera/set/light");
+      client.subscribe("Haier/Camera/set/airflow");
+      client.subscribe("Haier/Camera/set/turbo");
+      client.subscribe("Haier/Camera/set/quiet");
+      
     } else {
       delay(5000);
     }
   }
+  digitalWrite(LED, HIGH);
 }
 
-void InsertData(byte data[], size_t size){
-    set_tmp = data[B_SET_TMP]+16;
-    cur_tmp = data[B_CUR_TMP];
-    Mode = data[B_MODE];
-    fan_spd = data[B_FAN_SPD];
-    swing = data[B_SWING];
-    power = data[B_POWER];
-    lock_rem = data[B_LOCK_REM];
-    fresh = data[B_FRESH];
+void InsertData(byte olddata[], size_t size){
+  byte mqdata[37] = {};
+  for(int bajt = 0; bajt < size; bajt++){
+    mqdata[bajt] = olddata[bajt];
+  }
+    set_tmp = mqdata[B_SET_TMP]+16;
+    cur_tmp = mqdata[B_CUR_TMP];
+    Mode = mqdata[B_MODE];
+    fan_spd = mqdata[B_FAN_SPD];
+    swing = mqdata[B_SWING];
+    power = (int)bitRead( mqdata[B_POWER], 0);
+    lock_rem = mqdata[B_LOCK_REM];
+    fresh = (int)bitRead( mqdata[B_FRESH], 0);
+    light = (int)bitRead( mqdata[B_FRESH], 5);
+    noise = (int)bitRead( mqdata[B_FRESH], 1) + 2*(int)bitRead( mqdata[B_FRESH], 2);
+    health = (int)bitRead( mqdata[B_POWER], 3);
+    health_airflow = (int)bitRead( mqdata[B_FRESH], 3) + 2*(int)bitRead( mqdata[B_FRESH], 4);
+    compressor = (int)bitRead( mqdata[B_POWER], 4);
+    
+    
   /////////////////////////////////
   if (fresh == 0x00){
-      client.publish("myhome/Conditioner/Fresh", "off");
+      client.publish("Haier/Camera/get/fresh", "off");
   }
   if (fresh == 0x01){
-      client.publish("myhome/Conditioner/Fresh", "on");
+      client.publish("Haier/Camera/get/fresh", "on");
+  }
+  /////////////////////////////////
+  if (light == 0x00){
+      client.publish("Haier/Camera/get/light", "on");
+  }
+  if (light == 0x01){
+      client.publish("Haier/Camera/get/light", "off");
+  }
+  /////////////////////////////////
+  if (noise == 0x00){
+      client.publish("Haier/Camera/get/quiet", "off");
+      client.publish("Haier/Camera/get/turbo", "off");
+  }
+  if (noise == 0x01){
+      client.publish("Haier/Camera/get/quiet", "off");
+      client.publish("Haier/Camera/get/turbo", "on");
+  }
+  if (noise == 0x02){
+      client.publish("Haier/Camera/get/quiet", "on");
+      client.publish("Haier/Camera/get/turbo", "off");
+  }
+  if (noise == 0x03){ //WTF??
+      client.publish("Haier/Camera/get/quiet", "on");
+      client.publish("Haier/Camera/get/turbo", "on");
+  }  
+  /////////////////////////////////
+  if (health == 0x00){
+      client.publish("Haier/Camera/get/ionizer", "off");
+  }
+  if (health == 0x01){
+      client.publish("Haier/Camera/get/ionizer", "on");
+  }
+  /////////////////////////////////
+  if (health_airflow == 0x00){
+      client.publish("Haier/Camera/get/airflow", "off");
+  }
+  if (health_airflow == 0x01){
+      client.publish("Haier/Camera/get/airflow", "up");
+  }
+  if (health_airflow == 0x02){
+      client.publish("Haier/Camera/get/airflow", "down");
+  }
+  if (health_airflow == 0x03){ // WTF??
+      client.publish("Haier/Camera/get/airflow", "unknown");
   }
   /////////////////////////////////
   if (lock_rem == 0x80){
-      client.publish("myhome/Conditioner/Lock_Remote", "true");
+      client.publish("Haier/Camera/get/lock_rem", "true");
   }
   if (lock_rem == 0x00){
-      client.publish("myhome/Conditioner/Lock_Remote", "false");
+      client.publish("Haier/Camera/get/lock_rem", "false");
   }
   /////////////////////////////////
-  if (power == 0x01 || power == 0x11){
-      client.publish("myhome/Conditioner/Power", "on");
+  if (compressor == 0x00){
+      client.publish("Haier/Camera/get/Compressor", "off");
   }
-  if (power == 0x00 || power == 0x10){
-      client.publish("myhome/Conditioner/Power", "off");
+  if (compressor == 0x01){
+      client.publish("Haier/Camera/get/Compressor", "on");
   }
-  if (power == 0x09){
-      client.publish("myhome/Conditioner/Power", "quiet");
+  /////////////////////////////////
+  if (power == 0x01){
+      client.publish("Haier/Camera/get/power", "on");
   }
-  if (power == 0x11 || power == 0x10){
-      client.publish("myhome/Conditioner/Compressor", "on");
-  } else {
-    client.publish("myhome/Conditioner/Compressor", "off");
+  if (power == 0x00){
+      client.publish("Haier/Camera/get/power", "off");
   }
   /////////////////////////////////
   if (swing == 0x00){
-      client.publish("myhome/Conditioner/Swing", "off");
+      client.publish("Haier/Camera/get/swing", "off");
   }
   if (swing == 0x01){
-      client.publish("myhome/Conditioner/Swing", "ud");
+      client.publish("Haier/Camera/get/swing", "vertical");
   }
   if (swing == 0x02){
-      client.publish("myhome/Conditioner/Swing", "lr");
+      client.publish("Haier/Camera/get/swing", "horizontal");
   }
   if (swing == 0x03){
-      client.publish("myhome/Conditioner/Swing", "all");
+      client.publish("Haier/Camera/get/swing", "on");
   }
   /////////////////////////////////  
   if (fan_spd == 0x00){
-      client.publish("myhome/Conditioner/Fan_Speed", "max");
+      client.publish("Haier/Camera/get/fan_spd", "high");
   }
   if (fan_spd == 0x01){
-      client.publish("myhome/Conditioner/Fan_Speed", "mid");
+      client.publish("Haier/Camera/get/fan_spd", "medium");
   }
   if (fan_spd == 0x02){
-      client.publish("myhome/Conditioner/Fan_Speed", "min");
+      client.publish("Haier/Camera/get/fan_spd", "low");
   }
   if (fan_spd == 0x03){
-      client.publish("myhome/Conditioner/Fan_Speed", "auto");
+      client.publish("Haier/Camera/get/fan_spd", "auto");
   }
   /////////////////////////////////
   char b[5]; 
   String char_set_tmp = String(set_tmp);
   char_set_tmp.toCharArray(b,5);
-  client.publish("myhome/Conditioner/Set_Temp", b);
+  client.publish("Haier/Camera/get/set_tmp", b);
   ////////////////////////////////////
   String char_cur_tmp = String(cur_tmp);
   char_cur_tmp.toCharArray(b,5);
-  client.publish("myhome/Conditioner/Current_Temp", b);
+  client.publish("Haier/Camera/get/cur_tmp", b);
   ////////////////////////////////////
-  if (Mode == 0x00){
-      client.publish("myhome/Conditioner/Mode", "smart");
+  if (power == 0x00){
+    client.publish("Haier/Camera/get/Mode", "off");
   }
-  if (Mode == 0x01){
-      client.publish("myhome/Conditioner/Mode", "cool");
-  }
-  if (Mode == 0x02){
-      client.publish("myhome/Conditioner/Mode", "heat");
-  }
-  if (Mode == 0x03){
-      client.publish("myhome/Conditioner/Mode", "vent");
-  }
-  if (Mode == 0x04){
-      client.publish("myhome/Conditioner/Mode", "dry");
+  else{
+    if (Mode == 0x00){
+        client.publish("Haier/Camera/get/Mode", "smart");
+    }
+    if (Mode == 0x01){
+        client.publish("Haier/Camera/get/Mode", "cool");
+    }
+    if (Mode == 0x02){
+        client.publish("Haier/Camera/get/Mode", "heat");
+    }
+    if (Mode == 0x03){
+        client.publish("Haier/Camera/get/Mode", "fan_only");
+    }
+    if (Mode == 0x04){
+        client.publish("Haier/Camera/get/Mode", "dry");
+    }
   }
   
   String raw_str;
   char raw[75];
   for (int i=0; i < 37; i++){
-     if (data[i] < 10){
+     if (mqdata[i] < 0x10){
        raw_str += "0";
-       raw_str += String(data[i], HEX);
+       raw_str += String(mqdata[i], HEX);
      } else {
-      raw_str += String(data[i], HEX);
+      raw_str += String(mqdata[i], HEX);
      }    
   }
   raw_str.toUpperCase();
   raw_str.toCharArray(raw,75);
-  client.publish("myhome/Conditioner/RAW", raw);
+  client.publish("Haier/Camera/get/RAW", raw);
   
 ///////////////////////////////////
 }
@@ -196,76 +276,116 @@ inline unsigned char toHex( char ch ){
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
+  bool kontynnuj = false;
+  if (firsttransfer){
+    return;
+  }
+  if(unclean == 0){
+  for (int iter = 0; iter < 6; iter++){
+    for (int bajt = 0; bajt < 37; bajt++){
+      packdata[bajt] = olddata[bajt];
+    }
+    if(getCRC(packdata, (sizeof(packdata)/sizeof(byte))-1) == packdata[36]){
+      kontynnuj = true;
+    }
+    if(kontynnuj){
+      break;
+    }
+  }
+  }
+  else{
+    kontynnuj = true;
+  }
+  if(kontynnuj){
   payload[length] = '\0';
   String strTopic = String(topic);
   String strPayload = String((char*)payload);
   ///////////
-  if (strTopic == "myhome/Conditioner/Set_Temp"){
-    set_tmp = strPayload.toInt()-16;
-    if (set_tmp >= 0 && set_tmp <= 30){
-      data[B_SET_TMP] = set_tmp;      
+  if (strTopic == "Haier/Camera/set/set_tmp"){
+    if ((strPayload.toInt()-16) >= 0 && (strPayload.toInt()-16) <= 30){
+      packdata[B_SET_TMP] = strPayload.toInt()-16;      
     }
   }
   //////////
-  if (strTopic == "myhome/Conditioner/Mode"){
-     if (strPayload == "smart"){
-      data[B_MODE] = 0; 
+  if (strTopic == "Haier/Camera/set/Mode"){
+    int powerstate = power = (int)bitRead( packdata[B_POWER], 0);
+    if (strPayload == "off"){
+      SendData(off, sizeof(off)/sizeof(byte));
+      return;
+    }
+    if (strPayload == "smart"){
+      bitSet( packdata[B_POWER], 0);
+        packdata[B_MODE] = 0; 
     }
     if (strPayload == "cool"){
-        data[B_MODE] = 1;
+      bitSet( packdata[B_POWER], 0);
+        packdata[B_MODE] = 1;
     }
     if (strPayload == "heat"){
-        data[B_MODE] = 2; 
+      bitSet( packdata[B_POWER], 0);
+        packdata[B_MODE] = 2; 
     }
-    if (strPayload == "vent"){
-        data[B_MODE] = 3;
+    if (strPayload == "fan_only"){
+      bitSet( packdata[B_POWER], 0);
+        packdata[B_MODE] = 3;
     }
     if (strPayload == "dry"){
-        data[B_MODE] = 4;
+      bitSet( packdata[B_POWER], 0);
+        packdata[B_MODE] = 4;
     }
   }
   //////////
-  if (strTopic == "myhome/Conditioner/Fan_Speed"){
-     if (strPayload == "max"){
-      data[B_FAN_SPD] = 0; 
+  if (strTopic == "Haier/Camera/set/fan_spd"){
+    if (strPayload == "high"){
+        packdata[B_FAN_SPD] = 0; 
+        bitClear( packdata[B_FRESH], 1);
+        bitClear( packdata[B_FRESH], 2);
     }
-    if (strPayload == "mid"){
-        data[B_FAN_SPD] = 1;
+    if (strPayload == "medium"){
+        packdata[B_FAN_SPD] = 1;
+        bitClear( packdata[B_FRESH], 1);
+        bitClear( packdata[B_FRESH], 2);
     }
-    if (strPayload == "min"){
-        data[B_FAN_SPD] = 2; 
+    if (strPayload == "low"){
+        packdata[B_FAN_SPD] = 2; 
+        bitClear( packdata[B_FRESH], 1);
+        bitClear( packdata[B_FRESH], 2);
     }
     if (strPayload == "auto"){
-        data[B_FAN_SPD] = 3; 
+        packdata[B_FAN_SPD] = 3; 
     }
   }
   ////////
-  if (strTopic == "myhome/Conditioner/Swing"){
-     if (strPayload == "off"){
-      data[B_SWING] = 0; 
+  if (strTopic == "Haier/Camera/set/swing"){
+    if (strPayload == "off"){
+        packdata[B_SWING] = 0; 
     }
-    if (strPayload == "ud"){
-        data[B_SWING] = 1;
+    if (strPayload == "vertical"){
+        packdata[B_SWING] = 1;
+        bitClear( packdata[B_FRESH], 4);
+        bitClear( packdata[B_FRESH], 3);
     }
-    if (strPayload == "lr"){
-        data[B_SWING] = 2; 
+    if (strPayload == "horizontal"){
+        packdata[B_SWING] = 2; 
     }
-    if (strPayload == "all"){
-        data[B_SWING] = 3; 
+    if (strPayload == "on"){
+        packdata[B_SWING] = 3; 
+        bitClear( packdata[B_FRESH], 4);
+        bitClear( packdata[B_FRESH], 3);
     }
   }
   ////////
-  if (strTopic == "myhome/Conditioner/Lock_Remote"){
-     if (strPayload == "true"){
-      data[B_LOCK_REM] = 80;
+  if (strTopic == "Haier/Camera/set/lock_rem"){
+    if (strPayload == "true"){
+        packdata[B_LOCK_REM] = 80;
     }
     if (strPayload == "false"){
-        data[B_LOCK_REM] = 0;
+        packdata[B_LOCK_REM] = 0;
     }
   }
   ////////
-  if (strTopic == "myhome/Conditioner/Power"){
-     if (strPayload == "off" || strPayload == "false" || strPayload == "0"){
+  if (strTopic == "Haier/Camera/set/power"){
+    if (strPayload == "off" || strPayload == "false" || strPayload == "0"){
       SendData(off, sizeof(off)/sizeof(byte));
       return;
     }
@@ -273,30 +393,107 @@ void callback(char* topic, byte* payload, unsigned int length) {
       SendData(on, sizeof(on)/sizeof(byte));
       return;
     }
-    if (strPayload == "quiet"){
-        data[B_POWER] = 9;
+  }
+  ////////
+  if (strTopic == "Haier/Camera/set/ionizer"){
+    if (strPayload == "on"){
+        bitSet( packdata[B_POWER], 3);
+    }
+    if (strPayload == "off"){
+        bitClear( packdata[B_POWER], 3);
     }
   }
   ////////
-  if (strTopic == "myhome/Conditioner/RAW"){
-    char buf[75];
-    char hexbyte[3] = {0};
-    strPayload.toCharArray(buf, 75);
-    int octets[sizeof(buf) / 2] ;
-    for (int i=0; i < 76; i += 2){
-      hexbyte[0] = buf[i] ;
-      hexbyte[1] = buf[i+1] ;
-      data[i/2] = (toHex(hexbyte[0]) << 4) | toHex(hexbyte[1]);
+  if (strTopic == "Haier/Camera/set/fresh"){
+    if (strPayload == "on"){
+        bitSet( packdata[B_FRESH], 0);
     }
-    Serial.write(data, 37);
-    client.publish("myhome/Conditioner/RAW", buf);
+    if (strPayload == "off"){
+        bitClear( packdata[B_FRESH], 0);
+    }
   }
+  ////////
+  if (strTopic == "Haier/Camera/set/light"){
+    if (strPayload == "off"){
+      bitSet( packdata[B_FRESH], 5);
+    }
+    if (strPayload == "on"){
+      bitClear( packdata[B_FRESH], 5);
+    }
+  }
+  ////////
+  if (strTopic == "Haier/Camera/set/airflow"){
+    if (strPayload == "off"){
+        bitClear( packdata[B_FRESH], 4);
+        bitClear( packdata[B_FRESH], 3);
+    }
+    if (strPayload == "up"){
+        bitClear( packdata[B_FRESH], 4);
+        bitSet( packdata[B_FRESH], 3);
+        if(packdata[B_SWING] == 1){
+          packdata[B_SWING] = 0;
+        }
+        if(packdata[B_SWING] == 3){
+          packdata[B_SWING] = 2;
+        }
+    }
+    if (strPayload == "down"){
+        bitSet( packdata[B_FRESH], 4);
+        bitClear( packdata[B_FRESH], 3);
+        if(packdata[B_SWING] == 1){
+          packdata[B_SWING] = 0;
+        }
+        if(packdata[B_SWING] == 3){
+          packdata[B_SWING] = 2;
+        }
+    }
+  }
+  ////////
+  if (strTopic == "Haier/Camera/set/turbo"){
+    if (strPayload == "on"){
+        bitSet( packdata[B_FRESH], 1);
+        bitClear( packdata[B_FRESH], 2);
+        packdata[B_FAN_SPD] = 3;
+    }
+    if (strPayload == "off"){
+      
+        bitClear( packdata[B_FRESH], 1);
+    }
+  }
+  ////////
+  if (strTopic == "Haier/Camera/set/quiet"){
+    if (strPayload == "on"){
+        bitSet( packdata[B_FRESH], 2);
+        bitClear( packdata[B_FRESH], 1);
+        packdata[B_FAN_SPD] = 3;
+    }
+    if (strPayload == "off"){
+      
+        bitClear( packdata[B_FRESH], 2);
+    }
+  }
+  ////////
+  bool wyslac = false;
+  for (int bajt=0; bajt < 37; bajt++){
+    if (packdata[bajt] != olddata[bajt]){
+      wyslac = true;
+    }
+  }
+  packdata[B_CMD] = 0;
+  packdata[9] = 1;
+  packdata[10] = 77;
+  packdata[11] = 95;
   
-  data[B_CMD] = 0;
-  data[9] = 1;
-  data[10] = 77;
-  data[11] = 95;
-  SendData(data, sizeof(data)/sizeof(byte));
+  if(wyslac){
+    SendData(packdata, sizeof(packdata)/sizeof(byte));
+    if (transferinprog){
+      unclean = 2;
+    }
+    else{
+      unclean = 1;
+    }
+  }
+  }
 }
 
 void setup() {
@@ -305,7 +502,7 @@ void setup() {
   setup_wifi();
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-  ArduinoOTA.setHostname("Haier");
+  ArduinoOTA.setHostname(Name_ID);
   ArduinoOTA.onStart([]() {  });
   ArduinoOTA.onEnd([]() {  });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {  });
@@ -316,14 +513,33 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   if(Serial.available() > 0){
+    transferinprog = true;
     Serial.readBytes(data, 37);
     while(Serial.available()){
       delay(2);
       Serial.read();
     }
-    if (data[36] != inCheck){
-      inCheck = data[36];
-      InsertData(data, 37);
+    transferinprog = false;
+    if(getCRC(data, (sizeof(data)/sizeof(byte))-1) == data[36]){
+      bool nowy = false;
+      for(int bajt = 0; bajt < 37; bajt++){
+        if(data[bajt] != olddata[bajt]){
+          nowy = true;
+        }
+      }
+      if(nowy){
+        for(int bajt = 0; bajt < 37; bajt++){
+          olddata[bajt] = data[bajt];
+        }
+        InsertData(olddata, 37);
+      }
+      firsttransfer = false;
+      if (unclean == 2){
+        unclean = 1;
+      }
+      if (unclean == 1){
+        unclean = 0;
+      }
     }
   }
   
@@ -335,6 +551,7 @@ void loop() {
   long now = millis();
   if (now - prev > 5000) {
     prev = now;
-    SendData(qstn, sizeof(qstn)/sizeof(byte)); //Опрос кондиционера
+    SendData(qstn, sizeof(qstn)/sizeof(byte)); // polling
   }
+  delay(500);
 }
